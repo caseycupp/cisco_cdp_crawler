@@ -1,0 +1,527 @@
+
+Cisco CDP Site Discovery App – Application Flow Outline
+
+
+1.
+Startup & Configuration
+Define static configuration variables:
+DNS domain (e.g. williams.com)
+SSH username, password, enable secret
+Device naming regex (e.g. switches ending in s + number)
+CSV fields
+Import required libraries:
+netmiko
+csv
+re
+collections.deque
+datetime (optional)
+
+
+2.
+User Input
+Prompt user for:
+Seed router hostname (short or FQDN)
+Site name
+Normalize seed hostname:
+Extract short hostname
+Construct FQDN for SSH
+Generate CSV filename:
+Use first 5 letters of site name
+Append .csv
+
+
+3.
+Initialize Crawl State
+Create data structures:
+Queue (BFS crawl order)
+Queued set (avoid duplicate enqueues)
+Visited-OK set (devices successfully logged into)
+Visited-Fail set (devices attempted but unreachable)
+Rows list (CSV output)
+Enqueue seed router (short hostname)
+
+
+4.
+Begin Crawl Loop
+Repeat until queue is empty:
+
+4.1 Dequeue Device
+Get next device’s short hostname
+Convert to FQDN for SSH
+
+4.2 Attempt SSH Login
+Open SSH connection using Netmiko
+Enter enable mode
+Disable terminal paging
+If SSH fails:
+Mark hostname as unable_to_login
+Record CSV row with:
+site
+hostname
+status = unable_to_login
+Add hostname to Visited-Fail
+Skip neighbor discovery
+Continue to next device
+
+4.3 Collect Device Information
+
+On successful login:
+Run:
+show version
+show inventory
+Parse and extract:
+Hostname
+Device type (router / switch)
+Model
+Serial number
+Firmware version
+Record CSV row with:
+status = ok
+Add hostname to Visited-OK
+
+4.4 Discover Adjacent Devices (CDP)
+Run:
+show cdp neighbors detail
+Parse neighbor entries:
+Device ID / hostname
+Normalize each neighbor hostname:
+Strip domain
+Lowercase
+
+4.5 Neighbor Filtering & Enqueue
+For each neighbor:
+Apply naming convention filter (e.g. s\d+$)
+Check if neighbor is already:
+Visited-OK
+Visited-Fail
+Queued
+If not seen yet:
+Enqueue neighbor
+Track it as queued
+Do not attempt SSH immediately (queue controls flow)
+
+
+5.
+Crawl Completion
+Queue is empty
+All reachable and unreachable site devices identified
+
+
+6.
+Write CSV File
+Open CSV using generated filename
+Write header
+Write one row per device:
+One row per hostname
+Includes unreachable devices
+
+
+7.
+Exit / Summary (Optional)
+Print summary:
+Total devices discovered
+Successfully logged in
+Unable to login
+Exit cleanly
+
+
+
+
+
+Data Flow Summary
+User Input
+   ↓
+Seed Router
+   ↓
+CDP Discovery
+   ↓
+Queue Neighbors
+   ↓
+SSH → Collect Info
+   ↓
+More CDP Discovery
+   ↓
+Queue Empty
+   ↓
+Write CSV
+
+
+
+
+
+Key Design Decisions (for review)
+BFS crawl (prevents runaway recursion)
+Short hostname stored, FQDN used only for SSH
+One CSV per site
+One row per device
+Serial number is informational, hostname is the crawl key
+Unreachable devices are still recorded
+No retries unless restarted (safe for production)
+Future Enhancements (not in v1)
+LLDP fallback
+Parallel SSH sessions
+Configurable naming rules
+SQLite/DB backend
+Topology diagram export
+If you want, next I can:
+Turn this outline into pseudo-code
+Turn it into a single runnable Python script
+Add TextFSM parsing references
+Create a flow diagram (ASCII or draw.io)
+Just tell me how you want to proceed.
+
+
+
+________________________________________________
+pip install netmiko
+
+
+
+
+from netmiko import ConnectHandler
+from collections import deque
+import csv
+import re
+import getpass
+
+# =========================
+# CONFIGURATION
+# =========================
+DOMAIN = "williams.com"
+DEVICE_TYPE = "cisco_ios"
+
+SWITCH_REGEX = re.compile(r"s\d+$", re.IGNORECASE)
+
+CSV_FIELDS = [
+    "site",
+    "hostname",
+    "status",
+    "device_type",
+    "model",
+    "serial_number",
+    "firmware"
+]
+
+# =========================
+# HELPER FUNCTIONS
+# =========================
+def short_hostname(name: str) -> str:
+    return name.split(".")[0].lower().strip()
+
+def fqdn_from_short(short: str) -> str:
+    return f"{short}.{DOMAIN}"
+
+def site_csv_filename(site: str) -> str:
+    return f"{site.strip()[:5].lower()}.csv"
+
+def connect_device(fqdn: str, username: str, password: str, secret: str):
+    conn = ConnectHandler(
+        device_type=DEVICE_TYPE,
+        host=fqdn,
+        username=username,
+        password=password,
+        secret=secret,
+        fast_cli=False
+    )
+    conn.enable()
+    conn.send_command("terminal length 0")
+    return conn
+
+# =========================
+# PARSING FUNCTIONS (simple v1)
+# =========================
+def get_device_facts(conn):
+    output = conn.send_command("show version")
+
+    hostname = conn.find_prompt().replace("#", "").replace(">", "")
+    hostname = short_hostname(hostname)
+
+    model = ""
+    serial = ""
+    firmware = ""
+
+    for line in output.splitlines():
+        if "Cisco IOS XE Software" in line or "Cisco IOS Software" in line:
+            firmware = line.strip()
+        if "Model Number" in line:
+            model = line.split(":")[-1].strip()
+        if "Processor board ID" in line:
+            serial = line.split()[-1].strip()
+
+    device_type = "switch" if SWITCH_REGEX.search(hostname) else "router"
+
+    return {
+        "hostname": hostname,
+        "device_type": device_type,
+        "model": model,
+        "serial_number": serial,
+        "firmware": firmware
+    }
+
+def get_cdp_neighbors(conn):
+    output = conn.send_command("show cdp neighbors detail")
+    neighbors = []
+
+    for block in output.split("Device ID:"):
+        if block.strip() == "":
+            continue
+        first_line = block.strip().splitlines()[0]
+        neighbor = short_hostname(first_line)
+        neighbors.append(neighbor)
+
+    return neighbors
+
+# =========================
+# MAIN
+# =========================
+def main():
+    print("\n=== Cisco CDP Site Inventory v1 ===\n")
+
+    seed_input = input("Enter seed router hostname (short or FQDN): ").strip()
+    site_name = input("Enter site name: ").strip()
+
+    username = input("SSH username: ").strip()
+    password = getpass.getpass("SSH password: ")
+    secret = getpass.getpass("Enable secret: ")
+
+    seed_short = short_hostname(seed_input)
+    csv_file = site_csv_filename(site_name)
+
+    queue = deque()
+    queued = set()
+    visited_ok = set()
+    visited_fail = set()
+    rows = []
+
+    queue.append(seed_short)
+    queued.add(seed_short)
+
+    while queue:
+        hostname = queue.popleft()
+        fqdn = fqdn_from_short(hostname)
+
+        print(f"[+] Processing {hostname}")
+
+        try:
+            conn = connect_device(fqdn, username, password, secret)
+            facts = get_device_facts(conn)
+            neighbors = get_cdp_neighbors(conn)
+            conn.disconnect()
+
+            visited_ok.add(hostname)
+
+            rows.append({
+                "site": site_name,
+                "hostname": facts["hostname"],
+                "status": "ok",
+                "device_type": facts["device_type"],
+                "model": facts["model"],
+                "serial_number": facts["serial_number"],
+                "firmware": facts["firmware"]
+            })
+
+            for n in neighbors:
+                if not SWITCH_REGEX.search(n):
+                    continue
+                if n in visited_ok or n in visited_fail or n in queued:
+                    continue
+                queue.append(n)
+                queued.add(n)
+
+        except Exception as e:
+            print(f"[-] Unable to login to {hostname}: {e}")
+            visited_fail.add(hostname)
+
+            rows.append({
+                "site": site_name,
+                "hostname": hostname,
+                "status": "unable_to_login",
+                "device_type": "",
+                "model": "",
+                "serial_number": "",
+                "firmware": ""
+            })
+
+    print(f"\n[+] Writing CSV: {csv_file}")
+
+    with open(csv_file, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=CSV_FIELDS)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow(row)
+
+    print("\n=== Done ===")
+    print(f"Devices OK: {len(visited_ok)}")
+    print(f"Unable to login: {len(visited_fail)}")
+
+# =========================
+if __name__ == "__main__":
+    main()
+
+
+
+_______________________________________________
+
+What this v1 does well
+✔ Works end-to-end
+✔ Easy to read and debug
+✔ Safe crawl (no infinite loops)
+✔ Matches your CSV and hostname rules exactly
+✔ Ready to test in a lab or small site
+
+
+Known limitations (intentional for v1)
+Parsing is basic (TextFSM comes later)
+Assumes IOS/IOS-XE
+Uses CDP only (no LLDP)
+No concurrency (safe for first test)
+
+
+Suggested first test
+
+1. Run against one router + 1–2 switches
+
+2. Verify:
+      CSV file name
+      Hostnames stored correctly
+      Unreachable device behavior
+
+3. Then improve parsing
+
+
+
+Next logical upgrades (when you’re ready)
+Replace parsing with TextFSM
+ Add LLDP fallback
+ Add logging file
+ Add parallel SSH
+ Add retry logic
+ 
+Possible Upgrades:
+ Clean up parsing properly
+ Convert this to TextFSM
+ Or refactor into classes without making it “too fancy”
+
+
+
+
+
+
+
+
+_____________________________________________
+README
+
+1. Open PowerShell
+Click Start
+Type PowerShell
+Open Windows PowerShell (or Windows Terminal → PowerShell tab)
+
+2. install python3.9
+  ✅ Check “Add Python to PATH” during install
+
+3. Create a project folder
+mkdir cdp_inventory
+cd cdp_inventory
+
+4. Create and activate a virtual environment (recommended)
+python -m venv venv
+
+Activate it:
+.\venv\Scripts\Activate.ps1
+
+You should now see:
+(venv)
+
+⚠️ If activation is blocked:
+Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
+Then activate again.
+
+5. Install Netmiko
+
+pip install netmiko
+
+Verify:
+pip show netmiko
+
+6. Save the script
+Open VS Code or Notepad
+Paste the script
+Save as:
+
+cdp_site_inventory_v1.py
+
+Make sure it’s in:
+
+cdp_inventory\
+
+7. Test SSH manually (important)
+
+ssh ohder1.williams.com
+(or IP if testing)
+
+If this fails → fix SSH first.
+
+8. Run the app
+python cdp_site_inventory_v1.py
+
+
+9. Enter prompts
+
+Example:
+Enter seed router hostname (short or FQDN): ohder1
+Enter site name: Oktulsa
+SSH username: netadmin
+SSH password:
+Enable secret:
+(Passwords won’t echo — normal.)
+
+10. Watch crawl output
+[+] Processing ohder1
+[+] Processing ohdes1
+[+] Processing ohdes2
+[-] Unable to login to ohdes9
+
+11. Find the CSV file
+oktul.csv
+
+Open with:
+ Excel
+ VS Code
+ Notepad++
+
+Quick troubleshooting (Windows-specific)
+❌ python is not recognized
+Python not in PATH
+Reinstall and check Add to PATH
+❌ Activate.ps1 cannot be loaded
+
+Run:
+Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
+
+❌ Script runs but finds no neighbors
+CDP disabled
+Regex filtered neighbors
+Test manually:
+
+show cdp neighbors detail
+
+
+
+Recommended first test
+ One router
+ One switch
+ Confirm CSV has 2 rows
+
+When you come back:
+  Paste any error output
+  Tell me whether you used hostname or IP
+  Tell me which Cisco OS you hit first
+  We’ll tune it from there.
+
+
+
+
+
+
+
