@@ -1,0 +1,8 @@
+# CDP Crawler Lab - cuppco.lab
+# Add these to /etc/hosts manually or use as reference
+192.168.1.71  crawlr1.cuppco.lab  crawlr1
+192.168.1.72  crawlr2.cuppco.lab  crawlr2
+192.168.1.73  cdp_sw12.cuppco.lab  cdp_sw12
+192.168.1.74  cdp_sw13.cuppco.lab  cdp_sw13
+192.168.1.75  cdp_sw14.cuppco.lab  cdp_sw14
+192.168.1.76  cdp_sw15.cuppco.lab  cdp_sw15
